@@ -5,8 +5,8 @@ services:
     hostname: kafka
     ports:
       - 9092:9092
-#    volumes:
-#      - ./dockervol/kafka:/bitnami/kafka
+    volumes:
+      - ./dockervol/kafka:/bitnami/kafka
     environment:
       - TZ=Asia/Jakarta
       - KAFKA_CFG_NODE_ID=0
