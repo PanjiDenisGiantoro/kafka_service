@@ -55,7 +55,7 @@ func main() {
 		cancel()
 	}()
 
-	// Koneksi ke Oracle menggunakan go-ora
+	// Koneksi ke Oracle menggunakan go-oraa
 	connStr := go_ora.BuildUrl("10.18.2.19", port, "TRAINING", "JNEBILL", "JNEBILL", nil)
 	conn, err := sql.Open("oracle", connStr)
 	if err != nil {
