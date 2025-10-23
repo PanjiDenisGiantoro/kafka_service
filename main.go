@@ -16,35 +16,42 @@ import (
 )
 
 const (
-	topicName   = "mytopic"
 	kafkaBroker = "localhost:9092"
 )
 
 type KafkaMessage struct {
-	ID        int       `json:"id"` // Menyimpan ID
+	ID        int       `json:"id"`
 	Name      string    `json:"name"`
 	Age       int       `json:"age"`
 	Email     string    `json:"email"`
-	CreatedAt time.Time `json:"created_at"` // Menyimpan waktu pembuatan
-	UpdatedAt time.Time `json:"updated_at"` // Menyimpan waktu pembaruan
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
+
 type KafkaMessageForInsert struct {
 	Header string `json:"header"`
 	JSON   string `json:"json"`
 }
 
-// Fungsi untuk insert data ke Oracle menggunakan go-ora
+// ========================================================
+// === FUNGSI UNTUK DATABASE ORACLE
+// ========================================================
+
 func insertIntoOracle(conn *sql.DB, message KafkaMessageForInsert, offset int64) error {
-	// Update query SQL untuk memasukkan offset ke dalam kolom header
 	query := `INSERT INTO testkafka2 (header, json, category, created_at, updated_at) 
 	          VALUES (:header, :json, 'Kafka', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-	_, err := conn.Exec(query, sql.Named("header", fmt.Sprintf("Offset: %d", offset)), sql.Named("json", message.JSON))
+	_, err := conn.Exec(query,
+		sql.Named("header", fmt.Sprintf("Offset: %d", offset)),
+		sql.Named("json", message.JSON),
+	)
 	return err
 }
 
 func fetchDataFromDatabase(conn *sql.DB) ([]KafkaMessage, error) {
 	var messages []KafkaMessage
-	rows, err := conn.Query(`SELECT ID, NAME, AGE, EMAIL, CREATED_AT, UPDATED_AT FROM testkafka WHERE CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '12' HOUR and NAME ='JOKO' 100`)
+	rows, err := conn.Query(`SELECT ID, NAME, AGE, EMAIL, CREATED_AT, UPDATED_AT 
+		FROM testkafka 
+		WHERE CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '12' HOUR AND NAME = 'JOKO'`)
 	if err != nil {
 		return nil, err
 	}
@@ -52,116 +59,199 @@ func fetchDataFromDatabase(conn *sql.DB) ([]KafkaMessage, error) {
 
 	for rows.Next() {
 		var message KafkaMessage
-		// Update rows.Scan() untuk menangani 6 kolom
 		if err := rows.Scan(&message.ID, &message.Name, &message.Age, &message.Email, &message.CreatedAt, &message.UpdatedAt); err != nil {
 			return nil, err
 		}
 		messages = append(messages, message)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return messages, nil
+	return messages, rows.Err()
 }
+
+// ========================================================
+// === FUNGSI UNTUK MEMBUAT TOPIC KAFKA SECARA MANUAL
+// ========================================================
+
+func createKafkaTopic(topic string, partitions int, replicationFactor int) error {
+	conn, err := kafka.Dial("tcp", kafkaBroker)
+	if err != nil {
+		return fmt.Errorf("failed to connect to Kafka broker: %v", err)
+	}
+	defer conn.Close()
+
+	// Cek apakah topic sudah ada
+	partitionsList, err := conn.ReadPartitions()
+	if err != nil {
+		return fmt.Errorf("failed to read partitions: %v", err)
+	}
+	for _, p := range partitionsList {
+		if p.Topic == topic {
+			log.Printf("⚠️  Topic '%s' sudah ada — tidak perlu dibuat ulang\n", topic)
+			return nil
+		}
+	}
+
+	// Ambil controller untuk membuat topic
+	controller, err := conn.Controller()
+	if err != nil {
+		return fmt.Errorf("failed to get controller: %v", err)
+	}
+	controllerConn, err := kafka.Dial("tcp", fmt.Sprintf("%s:%d", controller.Host, controller.Port))
+	if err != nil {
+		return fmt.Errorf("failed to connect to controller: %v", err)
+	}
+	defer controllerConn.Close()
+
+	topicConfigs := []kafka.TopicConfig{
+		{
+			Topic:             topic,
+			NumPartitions:     partitions,
+			ReplicationFactor: replicationFactor,
+		},
+	}
+
+	err = controllerConn.CreateTopics(topicConfigs...)
+	if err != nil {
+		return fmt.Errorf("failed to create topic '%s': %v", topic, err)
+	}
+
+	log.Printf("🎉 Topic '%s' berhasil dibuat dengan %d partition dan replication factor %d\n",
+		topic, partitions, replicationFactor)
+	return nil
+}
+
+// ========================================================
+// === MAIN PROGRAM
+// ========================================================
+
 func main() {
-	// Membuat konteks untuk menangani signal interupsi (CTRL+C)
+	if len(os.Args) < 3 {
+		fmt.Println(`
+Usage:
+  go run main.go create producer <topic>         -> Buat topic Kafka
+  go run main.go producer <topic>                -> Jalankan producer
+  go run main.go consumer <topic> <group_id>     -> Jalankan consumer
+`)
+		return
+	}
+
+	command := os.Args[1]
+	mode := os.Args[2]
+	var topic string
+
+	if command == "create" {
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: go run main.go create producer <topic>")
+			return
+		}
+		topic = os.Args[3]
+	} else {
+		topic = os.Args[2]
+	}
+
+	// Context untuk Ctrl+C
 	ctx, cancel := context.WithCancel(context.Background())
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
-	signal.Notify(sig, syscall.SIGTERM)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sig
 		cancel()
 	}()
 
-	// Koneksi ke Oracle menggunakan go-ora
+	// Koneksi ke Oracle (hanya dibutuhkan untuk producer dan consumer)
 	connStr := go_ora.BuildUrl("10.8.2.219", 1521, "JNEBILL", "JNEBILL", "JNE98292092B5494083OK", nil)
-	conn, err := sql.Open("oracle", connStr)
+	dbConn, err := sql.Open("oracle", connStr)
 	if err != nil {
 		log.Fatal("Koneksi gagal:", err)
 	}
-	defer conn.Close()
+	defer dbConn.Close()
 
-	// Menangani argumen untuk menjalankan producer atau consumer
-	switch os.Args[1] {
-	// Fungsi Producer untuk mengirimkan data ke Kafka
+	switch command {
+	// ======================================================
+	// === CREATE TOPIC
+	// ======================================================
+	case "create":
+		if mode != "producer" {
+			fmt.Println("Usage: go run main.go create producer <topic>")
+			return
+		}
+		if err := createKafkaTopic(topic, 1, 1); err != nil {
+			log.Fatal("Gagal membuat topic:", err)
+		}
+		log.Printf("✅ Topic '%s' siap digunakan\n", topic)
+
+	// ======================================================
+	// === PRODUCER
+	// ======================================================
 	case "producer":
 		writer := &kafka.Writer{
 			Addr:         kafka.TCP(kafkaBroker),
 			Async:        true,
 			RequiredAcks: kafka.RequireOne,
-			BatchSize:    1000000,
+			BatchSize:    1000,
 			BatchTimeout: time.Second,
 			Compression:  kafka.Gzip,
 		}
 		defer writer.Close()
 
-		var messageID int // Initialize a counter to simulate offset ID for Key
-
-		// Modifikasi scheduler menjadi interval 5 detik untuk pengujian
-		ticker := time.NewTicker(10 * time.Second) // Ubah ke 5 detik
+		var messageID int
+		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 
 		for {
 			select {
+			case <-ctx.Done():
+				log.Println("⛔ Producer stopped by signal.")
+				return
 			case <-ticker.C:
-				// Mengambil data dari database
-				data, err := fetchDataFromDatabase(conn)
+				data, err := fetchDataFromDatabase(dbConn)
 				if err != nil {
-					log.Println("Error fetching data from database:", err)
+					log.Println("Error fetching data:", err)
 					continue
 				}
-
-				// Mengirim pesan ke Kafka
 				for _, message := range data {
-					// Convert KafkaMessage menjadi JSON
 					messageJSON, err := json.Marshal(message)
 					if err != nil {
-						log.Println("Error marshaling message:", err)
+						log.Println("Error marshaling:", err)
 						continue
 					}
-
-					// Create Key (using a combination of offset and name)
 					key := fmt.Sprintf("%d-%s", messageID, message.Name)
-
-					// Kirim pesan ke Kafka dengan Key
-					if err := writer.WriteMessages(ctx, kafka.Message{
-						Topic: topicName,
+					err = writer.WriteMessages(ctx, kafka.Message{
+						Topic: topic,
+						Key:   []byte(key),
 						Value: messageJSON,
-						Key:   []byte(key), // Set Key as offset and name
-					}); err != nil {
+					})
+					if err != nil {
 						log.Println("Error sending message:", err)
 						continue
 					}
-
-					messageID++ // Increment the message ID (offset)
+					log.Printf("📤 Sent message with key %s to topic %s", key, topic)
+					messageID++
 				}
 			}
 		}
 
-		// Fungsi Consumer untuk menerima pesan dari Kafka dan menyimpan ke Oracle
-		// Fungsi Consumer untuk menerima pesan dari Kafka dan menyimpan ke Oracle
+	// ======================================================
+	// === CONSUMER
+	// ======================================================
 	case "consumer":
-		if len(os.Args) < 3 {
-			fmt.Println("Consumer group ID required. Example: go run main.go consumer <group_id>")
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: go run main.go consumer <topic> <group_id>")
 			return
 		}
+		groupId := os.Args[3]
 
-		groupId := os.Args[2]
-		consumer := kafka.NewReader(kafka.ReaderConfig{
-			Brokers: []string{kafkaBroker},
-			Topic:   topicName,
-			GroupID: groupId,
-			// Set maximum number of messages to read at once
-			MaxBytes: 10e6, // 10MB max message size
-			// Optionally, set the StartOffset if you need to consume from a specific point
-			StartOffset: kafka.FirstOffset,
+		reader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers:  []string{kafkaBroker},
+			Topic:    topic,
+			GroupID:  groupId,
+			MaxBytes: 10e6,
 		})
+		defer reader.Close()
 
-		// Membaca pesan dari Kafka dan insert ke Oracle
 		for {
-			m, err := consumer.FetchMessage(ctx)
+			m, err := reader.FetchMessage(ctx)
 			if errors.Is(err, context.Canceled) {
+				log.Println("⛔ Consumer stopped by signal.")
 				break
 			}
 			if err != nil {
@@ -169,38 +259,32 @@ func main() {
 				continue
 			}
 
-			// Parse JSON yang diterima dari Kafka
 			var message KafkaMessage
 			if err := json.Unmarshal(m.Value, &message); err != nil {
-				log.Println("Error unmarshalling message:", err, "Message:", string(m.Value))
+				log.Println("Error unmarshalling:", err)
 				continue
 			}
 
-			// Log Key yang berisi offset ID dan name
-			log.Printf("Consumed message with Key: %s\n", string(m.Key))
+			log.Printf("📥 Consumed message Key=%s, Topic=%s", string(m.Key), topic)
 
-			// Siapkan data untuk insert ke Oracle
 			kafkaMessageForInsert := KafkaMessageForInsert{
 				Header: fmt.Sprintf("Header for %s", message.Name),
 				JSON:   string(m.Value),
 			}
 
-			// Insert data ke Oracle DB dengan menyertakan offset
-			if err := insertIntoOracle(conn, kafkaMessageForInsert, m.Offset); err != nil {
-				log.Println("Error inserting data to Oracle:", err)
+			if err := insertIntoOracle(dbConn, kafkaMessageForInsert, m.Offset); err != nil {
+				log.Println("Error inserting to Oracle:", err)
 				continue
 			}
 
-			// Log untuk menandakan bahwa data telah berhasil disimpan ke database
-			log.Printf("Data for %s (ID: %d) successfully inserted into Oracle DB\n", message.Name, message.Age)
+			log.Printf("✅ Data for %s inserted to Oracle DB", message.Name)
 
-			// Commit pesan Kafka setelah sukses insert
-			err = consumer.CommitMessages(ctx, m)
-			if err != nil {
-				log.Println("Error committing message:", err)
-				continue
+			if err := reader.CommitMessages(ctx, m); err != nil {
+				log.Println("Error committing:", err)
 			}
 		}
 
+	default:
+		fmt.Println("Perintah tidak dikenal. Gunakan: create | producer | consumer")
 	}
 }
